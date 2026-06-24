@@ -243,9 +243,10 @@ def main():
     print("  GESTURES:", flush=True)
     print("    Point       = Air pointer", flush=True)
     print("    Open palm   = Swipe L/R for slides", flush=True)
-    print("    Pinch       = Start marking area", flush=True)
-    print("    Draw + Pinch = Complete highlight", flush=True)
-    print("    Middle pinch = Cancel marking", flush=True)
+    print("    Pinch          = Set rectangle start point", flush=True)
+    print("    Move finger    = Resize rectangle selection", flush=True)
+    print("    Pinch again    = Confirm rectangle highlight", flush=True)
+    print("    Middle pinch   = Cancel rectangle selection", flush=True)
     print("    Peace (1s)  = Clear highlights", flush=True)
     print("    Fist        = Idle", flush=True)
     print("  KEYS: m=mouse k=keys c=clear d=flip q=quit", flush=True)
@@ -435,7 +436,7 @@ def main():
         # Marker status hint
         if marker_state == "DRAWING":
             progress = marker.get_progress()
-            hint = f"Drawing... ({int(progress * 100)}%) — pinch to close"
+            hint = f"Rectangle selection... ({int(progress * 100)}%) — pinch to confirm"
             cv2.putText(frame, hint, (20, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
         elif marker_state == "IDLE" and highlighter.count() > 0:

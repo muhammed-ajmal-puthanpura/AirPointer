@@ -1,207 +1,333 @@
 # ============================================================
-# area_marker.py  (v5 — pinch to start, pinch to close)
+# area_marker.py  (v6 — Rectangle Selection Mode)
 #
 # Workflow:
-#   1. PINCH (thumb+index)     = drop pin + start drawing
-#   2. POINT (index up)        = draw boundary freely
-#   3. PINCH again (thumb+index) = close + complete highlight
-#   4. MIDDLE PINCH (thumb+middle) = CANCEL current marking
+#   1. Thumb + Index pinch      -> set rectangle start point
+#   2. Move index finger        -> resize rectangle like crop box
+#   3. Thumb + Index pinch again -> confirm rectangle highlight
+#   4. Thumb + Middle pinch     -> cancel rectangle
+#
+# Output is still compatible with the existing main.py:
+#   mark_result["points_px"] = rectangle polygon points
 # ============================================================
 
 import time
 import math
-from collections import deque
 
 
 class AreaMarker:
     STATE_IDLE = "IDLE"
     STATE_DRAWING = "DRAWING"
 
-    def __init__(self,
-                 min_points=15,
-                 min_dimension=0.02,
-                 cooldown=0.8,
-                 pinch_threshold=40,
-                 middle_pinch_threshold=50):
+    def __init__(
+        self,
+        min_points=4,
+        min_dimension=0.03,
+        cooldown=0.8,
+        pinch_threshold=40,
+        middle_pinch_threshold=50,
+        grid_size=10
+    ):
+        """
+        min_dimension:
+            Minimum rectangle width/height as normalized screen fraction.
+
+        pinch_threshold:
+            Pixel distance between thumb tip and index tip for start/close.
+
+        middle_pinch_threshold:
+            Pixel distance between thumb tip and middle tip for cancel.
+
+        grid_size:
+            Rectangle coordinates snap to this pixel grid.
+            Use 1 to disable grid snapping.
+        """
+
         self.min_points = min_points
         self.min_dimension = min_dimension
         self.cooldown = cooldown
         self.pinch_threshold = pinch_threshold
         self.middle_pinch_threshold = middle_pinch_threshold
+        self.grid_size = max(1, int(grid_size))
 
         self.state = self.STATE_IDLE
-        self.pin = None
-        self.pin_px = None
-        self.trail = []
-        self.trail_px = []
+
+        # Normalized points
+        self.start = None          # (nx, ny)
+        self.current = None        # (nx, ny)
+
+        # Pixel points
+        self.start_px = None       # (x, y)
+        self.current_px = None     # (x, y)
+
         self.last_mark_time = 0.0
 
-        print(f">>> AreaMarker v5 LOADED | "
-              f"pinch={pinch_threshold}px middle={middle_pinch_threshold}px", flush=True)
+        # Pinch edge detection
+        self.index_pinch_down = False
+        self.middle_pinch_down = False
 
+        print(
+            f">>> AreaMarker v6 RECTANGLE MODE LOADED | "
+            f"pinch={pinch_threshold}px middle={middle_pinch_threshold}px "
+            f"grid={self.grid_size}px",
+            flush=True
+        )
+
+    # ============================================================
+    # Utility methods
+    # ============================================================
     def _distance_px(self, p1, p2):
         return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
 
-    def _distance(self, p1, p2):
-        return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
-
-    def _bounding_box(self, points):
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        return min(xs), min(ys), max(xs), max(ys)
-
     def _is_thumb_index_pinch(self, landmarks):
-        """Thumb tip + Index tip touching."""
         thumb_tip = landmarks[4]
         index_tip = landmarks[8]
+
         dist = self._distance_px(
             (thumb_tip["x"], thumb_tip["y"]),
             (index_tip["x"], index_tip["y"])
         )
+
         return dist < self.pinch_threshold
 
     def _is_thumb_middle_pinch(self, landmarks):
-        """Thumb tip + Middle tip touching (cancel gesture)."""
         thumb_tip = landmarks[4]
         middle_tip = landmarks[12]
+
         dist = self._distance_px(
             (thumb_tip["x"], thumb_tip["y"]),
             (middle_tip["x"], middle_tip["y"])
         )
+
         return dist < self.middle_pinch_threshold
 
+    def _snap_px(self, x, y):
+        """
+        Snap pixel coordinates to a uniform grid.
+        This gives crop-tool-like rectangle movement.
+        """
+        if self.grid_size <= 1:
+            return int(x), int(y)
+
+        sx = round(x / self.grid_size) * self.grid_size
+        sy = round(y / self.grid_size) * self.grid_size
+
+        return int(sx), int(sy)
+
+    def _px_to_norm(self, x, y, fw, fh):
+        return x / fw, y / fh
+
+    def _make_rectangle_points_px(self):
+        """
+        Return rectangle polygon points in clockwise order.
+        """
+        if self.start_px is None or self.current_px is None:
+            return []
+
+        x1, y1 = self.start_px
+        x2, y2 = self.current_px
+
+        left = min(x1, x2)
+        right = max(x1, x2)
+        top = min(y1, y2)
+        bottom = max(y1, y2)
+
+        return [
+            (left, top),
+            (right, top),
+            (right, bottom),
+            (left, bottom),
+            (left, top),      # close polygon visually
+        ]
+
+    def _make_rectangle_points_norm(self, fw, fh):
+        pts_px = self._make_rectangle_points_px()
+        return [(x / fw, y / fh) for x, y in pts_px]
+
+    def _rectangle_dimensions_norm(self, fw, fh):
+        if self.start_px is None or self.current_px is None:
+            return 0.0, 0.0
+
+        x1, y1 = self.start_px
+        x2, y2 = self.current_px
+
+        width = abs(x2 - x1) / fw
+        height = abs(y2 - y1) / fh
+
+        return width, height
+
+    # ============================================================
+    # Main update method
+    # ============================================================
     def update(self, landmarks, finger_states, command, fw, fh):
+        """
+        Call every frame.
+
+        Returns:
+            None if rectangle is not completed.
+
+            dict if rectangle is confirmed:
+            {
+                "type": "rectangle",
+                "points_px": [(x,y), ...],
+                "bbox_px": (x1, y1, x2, y2),
+                "pin_px": (start_x, start_y),
+            }
+        """
+
         now = time.time()
 
         if (now - self.last_mark_time) < self.cooldown:
             return None
 
         tip = landmarks[8]
-        tip_px = (tip["x"], tip["y"])
-        tip_n = (tip["x"] / fw, tip["y"] / fh)
+        tip_x, tip_y = self._snap_px(tip["x"], tip["y"])
+        tip_px = (tip_x, tip_y)
+        tip_n = self._px_to_norm(tip_x, tip_y, fw, fh)
 
-        # ============================================================
+        is_index_pinch = self._is_thumb_index_pinch(landmarks)
+        is_middle_pinch = self._is_thumb_middle_pinch(landmarks)
+
+        # Rising-edge detection
+        index_pinch_started = is_index_pinch and not self.index_pinch_down
+        middle_pinch_started = is_middle_pinch and not self.middle_pinch_down
+
+        self.index_pinch_down = is_index_pinch
+        self.middle_pinch_down = is_middle_pinch
+
+        # ========================================================
         # STATE: IDLE
-        # ============================================================
+        # Waiting for first thumb+index pinch
+        # ========================================================
         if self.state == self.STATE_IDLE:
-            # Check for thumb+index pinch to start
-            if self._is_thumb_index_pinch(landmarks):
-                # Start new marking
-                self.pin = tip_n
-                self.pin_px = tip_px
-                self.trail = [tip_n]
-                self.trail_px = [tip_px]
+            if index_pinch_started:
+                self.start_px = tip_px
+                self.current_px = tip_px
+
+                self.start = tip_n
+                self.current = tip_n
+
                 self.state = self.STATE_DRAWING
-                print(f"  Pinch START at ({tip_px[0]}, {tip_px[1]})", flush=True)
+
+                print(
+                    f"  Rectangle START at ({tip_px[0]}, {tip_px[1]})",
+                    flush=True
+                )
 
             return None
 
-        # ============================================================
+        # ========================================================
         # STATE: DRAWING
-        # ============================================================
+        # Rectangle expands from start point to current index position
+        # ========================================================
         if self.state == self.STATE_DRAWING:
-            is_thumb_index = self._is_thumb_index_pinch(landmarks)
-            is_middle_pinch = self._is_thumb_middle_pinch(landmarks)
 
-            # ---- CANCEL: middle pinch ----
-            if is_middle_pinch:
-                print("  Middle pinch CANCELLED marking", flush=True)
+            # Cancel with thumb + middle pinch
+            if middle_pinch_started:
+                print("  Rectangle CANCELLED by middle pinch", flush=True)
                 self._cancel()
                 return None
 
-            # ---- CLOSE: thumb+index pinch while pointing ----
-            if is_thumb_index and command == "POINTER":
-                # Complete the marking
-                result = self._complete_mark(fw, fh)
+            # Update rectangle endpoint whenever not closing
+            if not is_index_pinch:
+                self.current_px = tip_px
+                self.current = tip_n
+
+            # Confirm rectangle with second thumb+index pinch
+            if index_pinch_started:
+                result = self._complete_rectangle(fw, fh)
                 return result
-
-            # ---- Keep drawing: pointing ----
-            if command == "POINTER" and not is_thumb_index:
-                # Only add if moved enough (prevents duplicate points)
-                if not self.trail or self._distance(tip_n, self.trail[-1]) > 0.004:
-                    self.trail.append(tip_n)
-                    self.trail_px.append(tip_px)
-
-                    if len(self.trail) > 500:
-                        self.trail.pop(0)
-                        self.trail_px.pop(0)
-
-            # ---- Re-start: pinch while already drawing ----
-            # (move the pin and restart)
-            if is_thumb_index and command != "POINTER":
-                self.pin = tip_n
-                self.pin_px = tip_px
-                self.trail = [tip_n]
-                self.trail_px = [tip_px]
-                print(f"  Pinch RESTART at ({tip_px[0]}, {tip_px[1]})", flush=True)
-
-            # ---- Cancel on fist ----
-            if command == "IDLE" and not is_thumb_index and not is_middle_pinch:
-                # Give it a moment — maybe user just relaxed briefly
-                # Don't cancel immediately, let it resume if they point again
-                pass
 
         return None
 
-    def _complete_mark(self, fw, fh):
-        if len(self.trail) < self.min_points:
-            print(f"  Too few points ({len(self.trail)}), cancelled.", flush=True)
+    # ============================================================
+    # Complete rectangle
+    # ============================================================
+    def _complete_rectangle(self, fw, fh):
+        width, height = self._rectangle_dimensions_norm(fw, fh)
+
+        if width < self.min_dimension or height < self.min_dimension:
+            print(
+                f"  Rectangle too small "
+                f"(w={width:.3f}, h={height:.3f}), cancelled.",
+                flush=True
+            )
             self._cancel()
             return None
 
-        x1, y1, x2, y2 = self._bounding_box(self.trail)
-        width = x2 - x1
-        height = y2 - y1
+        points_px = self._make_rectangle_points_px()
 
-        if width < self.min_dimension and height < self.min_dimension:
-            print("  Area too small, cancelled.", flush=True)
-            self._cancel()
-            return None
+        xs = [p[0] for p in points_px]
+        ys = [p[1] for p in points_px]
 
-        # Close the polygon
-        if self.pin:
-            self.trail.append(self.pin)
-            self.trail_px.append(self.pin_px)
-
-        bx1, by1, bx2, by2 = self._bounding_box(self.trail_px)
+        bbox_px = (
+            min(xs),
+            min(ys),
+            max(xs),
+            max(ys)
+        )
 
         result = {
-            "type": "freeform",
-            "points_px": list(self.trail_px),
-            "bbox_px": (bx1, by1, bx2, by2),
-            "pin_px": self.pin_px,
+            "type": "rectangle",
+            "points_px": points_px,
+            "bbox_px": bbox_px,
+            "pin_px": self.start_px,
         }
 
-        print(f"  Pinch CLOSE! {len(self.trail_px)} points, "
-              f"bbox=({bx1},{by1})-({bx2},{by2})", flush=True)
+        print(
+            f"  Rectangle COMPLETE! bbox={bbox_px}",
+            flush=True
+        )
 
         self.last_mark_time = time.time()
         self._cancel()
+
         return result
 
-    def _cancel(self):
-        self.state = self.STATE_IDLE
-        self.pin = None
-        self.pin_px = None
-        self.trail = []
-        self.trail_px = []
-
+    # ============================================================
+    # Public getters used by main.py
+    # ============================================================
     def get_state(self):
         return self.state
 
     def get_pin_px(self):
-        return self.pin_px
+        return self.start_px
 
     def get_trail_px(self):
-        return list(self.trail_px)
+        """
+        Existing main.py expects a trail/polygon list.
+        For rectangle mode, return rectangle preview points.
+        """
+        if self.state != self.STATE_DRAWING:
+            return []
+
+        return self._make_rectangle_points_px()
 
     def get_progress(self):
         """
-        Progress based on how many points drawn vs minimum needed.
+        Progress based on rectangle size.
         """
         if self.state != self.STATE_DRAWING:
             return 0.0
-        return min(1.0, len(self.trail) / self.min_points)
+
+        if self.start_px is None or self.current_px is None:
+            return 0.0
+
+        x1, y1 = self.start_px
+        x2, y2 = self.current_px
+
+        dist = self._distance_px((x1, y1), (x2, y2))
+
+        # Rough progress estimate
+        progress = min(1.0, dist / 250.0)
+        return progress
 
     def reset(self):
         self._cancel()
+
+    def _cancel(self):
+        self.state = self.STATE_IDLE
+        self.start = None
+        self.current = None
+        self.start_px = None
+        self.current_px = None
