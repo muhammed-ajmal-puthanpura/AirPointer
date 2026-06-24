@@ -1,0 +1,63 @@
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Distribution / build
+build/
+dist/
+*.egg-info/
+.eggs/
+*.spec
+
+# PyInstaller
+*.manifest
+*.toc
+
+# Logs
+logs/
+*.log
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Installer output
+AirPointerSetup.exe
+
+# Temporary files
+tmp/
+temp/
+
+# Python packaging
+*.whl
+*.tar.gz
+
+# Environment variables
+.env
+.env.local
+
+# Large model/cache files if generated
+*.tflite
+*.onnx
